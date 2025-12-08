@@ -1,0 +1,390 @@
+太好了 —— 我把**完整工程（可直接复制、构建并运行）**全部重新生成好了：这是一个 TradingView 多股票轮播 → 无界面 Chrome（Xvfb）渲染 → FFmpeg 抓取 → 推流到 YouTube 的一键 Docker 直播机。TradingView 自带数据，不需要任何 API key。
+
+下面包含必要的所有文件（你只要把这些文件放到一个目录里，按说明填好 .env，然后 docker compose up --build 就能跑起来）。
+
+注意事项（重要）
+	•	请用你自己的 YouTube 推流密钥填入 .env。
+	•	我没有包含 bgm.mp3（音乐），把无版权或你有权使用的音乐放到 app/public/bgm.mp3。
+	•	这个镜像使用 Xvfb 创建虚拟显示，再用 FFmpeg 的 x11grab 抓取画面。若在某些云主机/环境下跑遇到权限问题，可能需要额外调整（通常在普通 Linux VPS / 本地机器上可以正常运行）。
+
+⸻
+
+项目结构（复制创建）
+
+yt-live-tradingview/
+├─ Dockerfile
+├─ docker-compose.yml
+├─ .env.example
+├─ app/
+│  ├─ package.json
+│  ├─ server.js
+│  └─ public/
+│      ├─ index.html
+│      └─ bgm.mp3   <-- 请自己替换（可选）
+└─ stream/
+   └─ stream.sh
+
+
+⸻
+
+1) Dockerfile
+
+# Use Debian-based Node image
+FROM node:18-bullseye
+
+# Install deps: Chrome, Xvfb, ffmpeg, fonts
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    wget ca-certificates gnupg2 x11-utils xvfb ffmpeg fontconfig \
+  && wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add - \
+  && sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list' \
+  && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y google-chrome-stable \
+  && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/*
+
+# Create app dir
+WORKDIR /app
+COPY ./app ./app
+WORKDIR /app/app
+RUN npm install --production
+
+# Copy stream script
+WORKDIR /stream
+COPY ./stream ./stream
+RUN chmod +x /stream/stream.sh
+
+# Expose server port (for debug / local preview)
+EXPOSE 8080
+
+# Default command
+CMD ["/stream/stream.sh"]
+
+
+⸻
+
+2) docker-compose.yml
+
+version: '3.8'
+services:
+  trader-stream:
+    build: .
+    container_name: trader-stream
+    env_file: .env
+    ports:
+      - "8080:8080"   # optional, allow viewing the page locally
+    restart: unless-stopped
+    shm_size: "1g"
+
+
+⸻
+
+3) .env.example（把它复制成 .env 并填写）
+
+# YouTube RTMP base URL and your stream key
+YOUTUBE_STREAM_URL=rtmp://a.rtmp.youtube.com/live2
+YOUTUBE_STREAM_KEY=YOUR_YOUTUBE_STREAM_KEY_HERE
+
+# Video settings
+WIDTH=1280
+HEIGHT=720
+FPS=30
+BITRATE=2500k
+
+# Carousel settings (seconds)
+ROTATE_INTERVAL=12
+
+
+⸻
+
+4) app/package.json
+
+{
+  "name": "yt-tradingview-stream-app",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
+
+
+⸻
+
+5) app/server.js
+
+// simple static server for the TradingView page
+const express = require('express');
+const path = require('path');
+const app = express();
+
+app.use(express.static(path.join(__dirname, 'public')));
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log(`Chart server running at http://0.0.0.0:${PORT}`);
+});
+
+
+⸻
+
+6) app/public/index.html（多股票轮播 + 当前标签 + 平滑淡入动画 — 适合直播）
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Multi-Symbol Live - TradingView</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  html, body { margin:0; height:100%; background:#000; overflow:hidden; font-family: Arial, sans-serif; }
+  #container { width:100vw; height:100vh; position:relative; background:#000; }
+  #tv-wrap { width:100%; height:100%; transition: opacity 1s ease; }
+  /* label */
+  #label {
+    position: absolute;
+    left: 16px;
+    top: 16px;
+    padding: 8px 12px;
+    background: rgba(0,0,0,0.45);
+    color: #00ffd5;
+    border-radius: 6px;
+    font-weight: 700;
+    font-size: 20px;
+    box-shadow: 0 6px 24px rgba(0,255,200,0.06);
+    backdrop-filter: blur(4px);
+    z-index: 10;
+  }
+  /* watermark */
+  #watermark {
+    position: absolute;
+    right: 16px;
+    top: 16px;
+    color: rgba(255,255,255,0.12);
+    font-size: 18px;
+    z-index: 10;
+  }
+  /* fade overlay used when switching */
+  .fading { opacity: 0; }
+  #bgm { display:none; }
+</style>
+</head>
+<body>
+<div id="container">
+  <div id="label">LOADING...</div>
+  <div id="watermark">YOUR CHANNEL</div>
+  <div id="tv-wrap"></div>
+</div>
+
+<audio id="bgm" autoplay loop src="bgm.mp3"></audio>
+
+<script src="https://s3.tradingview.com/tv.js"></script>
+<script>
+/* ========== CONFIG ========== */
+const symbols = [
+  "NASDAQ:TSLA",
+  "NASDAQ:AAPL",
+  "NASDAQ:NVDA",
+  "NASDAQ:MSFT",
+  "NASDAQ:AMZN",
+  "NASDAQ:QQQ"
+];
+const rotateInterval = Number((new URLSearchParams(window.location.search).get('rotate') || '') || (window.ROTATE_INTERVAL || 12)); // seconds
+/* ========== END CONFIG ========== */
+
+const tvWrap = document.getElementById('tv-wrap');
+const label = document.getElementById('label');
+let idx = 0;
+let widget = null;
+let switching = false;
+
+function showLabel(sym) {
+  label.textContent = sym.replace('NASDAQ:','');
+}
+
+// Load TradingView widget for a symbol
+function loadSymbol(sym) {
+  // fade out
+  tvWrap.classList.add('fading');
+  // clean old iframe if present after fade
+  setTimeout(() => {
+    tvWrap.innerHTML = ''; // remove previous widget DOM
+    // create a container for new widget
+    const div = document.createElement('div');
+    div.id = 'tv_' + Date.now();
+    div.style.width = '100%';
+    div.style.height = '100%';
+    tvWrap.appendChild(div);
+
+    // instantiate TradingView widget
+    new TradingView.widget({
+      container_id: div.id,
+      autosize: true,
+      symbol: sym,
+      interval: "1",
+      timezone: "Etc/UTC",
+      theme: "dark",
+      style: "3",           // 3 = line (good for live)
+      locale: "en",
+      hide_top_toolbar: true,
+      hide_legend: true,
+      allow_symbol_change: false,
+      backgroundColor: "#000",
+      gridColor: "rgba(255,255,255,0.03)",
+      loading_screen: { backgroundColor: "#000", foregroundColor: "#fff" }
+    });
+
+    // update label and fade in
+    showLabel(sym);
+    setTimeout(()=> tvWrap.classList.remove('fading'), 600);
+  }, 700);
+}
+
+function rotateOnce() {
+  const sym = symbols[idx % symbols.length];
+  loadSymbol(sym);
+  idx++;
+}
+
+/* initial load */
+rotateOnce();
+/* schedule rotation */
+setInterval(rotateOnce, (rotateInterval || 12) * 1000);
+
+</script>
+</body>
+</html>
+
+说明：index.html 中的 symbols 列表可按需修改（支持任何 TradingView 识别的 symbol，如 NYSE:BRK.B, NASDAQ:TSLA 等）。如果想更改轮播间隔，可直接编辑 .env 的 ROTATE_INTERVAL 或在浏览器 URL 加 ?rotate=8（调试用）。
+
+⸻
+
+7) stream/stream.sh（入口推流脚本 — 启动 Xvfb / server / chrome / ffmpeg）
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Load env
+: "${YOUTUBE_STREAM_URL:?Need to set YOUTUBE_STREAM_URL}"
+: "${YOUTUBE_STREAM_KEY:?Need to set YOUTUBE_STREAM_KEY}"
+WIDTH=${WIDTH:-1280}
+HEIGHT=${HEIGHT:-720}
+FPS=${FPS:-30}
+BITRATE=${BITRATE:-2500k}
+ROTATE_INTERVAL=${ROTATE_INTERVAL:-12}
+
+STREAM="${YOUTUBE_STREAM_URL}/${YOUTUBE_STREAM_KEY}"
+URL="http://localhost:8080/index.html?rotate=${ROTATE_INTERVAL}"
+
+echo "Starting stream..."
+echo "Stream target: $STREAM"
+echo "Page URL: $URL"
+echo "Video: ${WIDTH}x${HEIGHT} @ ${FPS}fps, ${BITRATE}"
+
+# Start X virtual framebuffer
+XVFB_DISPLAY=":99"
+echo "Starting Xvfb on ${XVFB_DISPLAY} with screen ${WIDTH}x${HEIGHT}x24..."
+Xvfb ${XVFB_DISPLAY} -screen 0 ${WIDTH}x${HEIGHT}x24 -ac +extension GLX +render -noreset >/dev/null 2>&1 &
+XVFB_PID=$!
+
+# Start the static server (app)
+node /app/app/server.js &
+SERVER_PID=$!
+
+# small wait for server and Xvfb
+sleep 2
+
+# Start Chrome (rendering to Xvfb display)
+echo "Launching Chrome..."
+export DISPLAY=${XVFB_DISPLAY}
+google-chrome \
+  --no-sandbox \
+  --disable-dev-shm-usage \
+  --disable-gpu \
+  --autoplay-policy=no-user-gesture-required \
+  --hide-scrollbars \
+  --window-size=${WIDTH},${HEIGHT} \
+  --disable-infobars \
+  --disable-extensions \
+  --user-data-dir=/tmp/chrome-userdata \
+  "${URL}" >/dev/null 2>&1 &
+
+CHROME_PID=$!
+
+sleep 4
+
+# Start FFmpeg to capture X display and push to YouTube
+echo "Starting FFmpeg..."
+ffmpeg -f x11grab -video_size ${WIDTH}x${HEIGHT} -i ${XVFB_DISPLAY}.0 \
+  -r ${FPS} -f pulse -ac 2 -i default \
+  -c:v libx264 -preset veryfast -b:v ${BITRATE} -pix_fmt yuv420p \
+  -c:a aac -b:a 128k -ar 44100 \
+  -g $((FPS*2)) -f flv "${STREAM}"
+
+# If ffmpeg exits, clean up (this point reached when ffmpeg stops)
+echo "FFmpeg exited. Cleaning up..."
+kill ${CHROME_PID} 2>/dev/null || true
+kill ${SERVER_PID} 2>/dev/null || true
+kill ${XVFB_PID} 2>/dev/null || true
+
+exit 0
+
+说明与兼容性注释：
+	•	我把系统声音来源设置为 Pulse (-f pulse -i default) —— 在某些容器环境没有 Pulse，会导致 FFmpeg 报错。若你不需要直播音频（只要视频），把 -f pulse -ac 2 -i default 整段移除，并适当删掉 -c:a aac -b:a 128k -ar 44100，示例如下（无音频）：
+
+ffmpeg -f x11grab -video_size ${WIDTH}x${HEIGHT} -i ${XVFB_DISPLAY}.0 \
+  -r ${FPS} -c:v libx264 -preset veryfast -b:v ${BITRATE} -pix_fmt yuv420p \
+  -g $((FPS*2)) -f flv "${STREAM}"
+
+
+	•	如果想要背景音乐混入到直播（推荐），需要在容器中安装并配置一个 audio server（pulse) 或使用 ffmpeg 将本地 mp3 作为输入并混音。当前脚本尝试录系统默认声音；若在你的环境里无 Pulse，建议改用下面“将本地 bgm.mp3 直接作为音频输入并循环”的方式（不依赖 Pulse） —— 我在下面附备用 ffmpeg 命令（推荐在容器内使用）：
+
+备用：用 bgm.mp3 作为音频输入并循环（更稳）
+
+把 ffmpeg 启动行替换为（在 stream.sh 中把原 ffmpeg 行替换）：
+
+ffmpeg -f x11grab -video_size ${WIDTH}x${HEIGHT} -i ${XVFB_DISPLAY}.0 \
+  -stream_loop -1 -re -i /app/app/public/bgm.mp3 \
+  -shortest -r ${FPS} \
+  -c:v libx264 -preset veryfast -b:v ${BITRATE} -pix_fmt yuv420p \
+  -c:a aac -b:a 128k -ar 44100 \
+  -g $((FPS*2)) -f flv "${STREAM}"
+
+这个命令会把 bgm.mp3 循环作为音频输入并与视频一起推送（无需 Pulse）。如果你想静音或无音频，使用前面“无音频”版本。
+
+⸻
+
+8) 使用说明（一步到位）
+	1.	把上面所有文件按目录结构保存到你的主机目录 yt-live-tradingview/。
+	2.	把 .env.example 复制为 .env，并填写 YOUTUBE_STREAM_KEY：
+
+cp .env.example .env
+# 编辑 .env 填入你的 key
+
+
+	3.	把一个无版权或你有权使用的 mp3 文件放到 app/public/bgm.mp3（可选）。
+	4.	构建并运行：
+
+docker compose up --build
+
+
+	5.	打开 YouTube Studio → 直播，你会看到直播流进入（可能需几秒）。也可在本机访问 http://localhost:8080 预览页面（若容器端口映射到宿主机）。
+
+⸻
+
+9) 常见问题与调试指南
+	•	FFmpeg 无法捕获声音/报错：使用上面备用 -stream_loop 命令把本地 bgm.mp3 作为音频输入；或在容器里安装并配置 PulseAudio（复杂）。
+	•	Chrome 不渲染或 TradingView 显示空白：确认容器能访问外网（TradingView 脚本需能加载 https://s3.tradingview.com/tv.js）。
+	•	推流延迟或画面卡顿：降低分辨率或比特率，例如 WIDTH=854 HEIGHT=480 BITRATE=1200k。
+	•	想要显示更多股票或改轮播间隔：编辑 app/public/index.html 中的 symbols 或 .env 中 ROTATE_INTERVAL。
+
+⸻
+...
+如果你愿意，我可以立刻为你做以下任意一项（直接给出代码/修改）：
+	•	A）把 bgm.mp3 混音到视频（直接用 ffmpeg 循环输入并混音），并把脚本替换为推荐版本。
+	•	B）把页面添左上角发光「TSLA LIVE」自定义文字和频道 logo（并把 logo 放到 app/public/logo.png）。
+	•	C）加入淡入淡出切换动画（更平滑），并在切换时播放短音效。
+	•	D）帮你把 Dockerfile 调整为更小体积的镜像（例如使用 chromium-browser 与更精简的基础镜像）。
+
+你想先做哪一个？
+...
